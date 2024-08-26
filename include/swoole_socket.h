@@ -53,7 +53,7 @@ static bool IN_IS_ADDR_LOOPBACK(struct in_addr *a) {
 
 // OS Feature
 #if defined(HAVE_KQUEUE) || !defined(HAVE_SENDFILE)
-int swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size);
+ssize_t swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size);
 #else
 #include <sys/sendfile.h>
 #define swoole_sendfile(out_fd, in_fd, offset, limit) sendfile(out_fd, in_fd, offset, limit)
@@ -387,7 +387,7 @@ struct Socket {
     ssize_t ssl_send(const void *__buf, size_t __n);
     ssize_t ssl_readv(IOVector *io_vector);
     ssize_t ssl_writev(IOVector *io_vector);
-    int ssl_sendfile(const File &fp, off_t *offset, size_t size);
+    ssize_t ssl_sendfile(const File &fp, off_t *offset, size_t size);
     STACK_OF(X509) * ssl_get_peer_cert_chain();
     std::vector<std::string> ssl_get_peer_cert_chain(int limit);
     X509 *ssl_get_peer_certificate();
@@ -491,6 +491,12 @@ struct Socket {
     ssize_t read(void *__buf, size_t __len) {
         return ::read(fd, __buf, __len);
     }
+
+    /**
+     * Read data from the socket synchronously without setting non-blocking or blocking IO,
+     * and allow interruptions by signals.
+     */
+    ssize_t read_sync(void *__buf, size_t __len, int timeout_ms = -1);
 
     int shutdown(int __how) {
         return ::shutdown(fd, __how);

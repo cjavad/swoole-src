@@ -571,9 +571,9 @@ static int ProcessPool_worker_loop_with_task_protocol(ProcessPool *pool, Worker 
             }
             pool->stream_info_->last_connection = conn;
         } else {
-            n = worker->pipe_worker->read(&out.buf, sizeof(out.buf));
+            n = worker->pipe_worker->read_sync(&out.buf, sizeof(out.buf));
             if (n < 0 && errno != EINTR) {
-                swoole_sys_warning("[Worker#%d] read(%d) failed", worker->id, worker->pipe_worker->fd);
+                swoole_sys_warning("read(%d) failed", worker->pipe_worker->fd);
             }
         }
 
@@ -683,7 +683,7 @@ static int ProcessPool_worker_loop_with_stream_protocol(ProcessPool *pool, Worke
     QueueNode *outbuf = (QueueNode *) pool->packet_buffer;
     outbuf->mtype = 0;
 
-    while (pool->running) {
+    while (pool->running && !SwooleWG.shutdown) {
         /**
          * fetch task
          */
@@ -723,9 +723,9 @@ static int ProcessPool_worker_loop_with_stream_protocol(ProcessPool *pool, Worke
             msg.data = pool->packet_buffer;
             pool->stream_info_->last_connection = conn;
         } else {
-            n = worker->pipe_worker->read(pool->packet_buffer, pool->max_packet_size_);
+            n = worker->pipe_worker->read_sync(pool->packet_buffer, pool->max_packet_size_);
             if (n < 0 && errno != EINTR) {
-                swoole_sys_warning("[Worker#%d] read(%d) failed", worker->id, worker->pipe_worker->fd);
+                swoole_sys_warning("read(%d) failed", worker->pipe_worker->fd);
             }
             msg.data = pool->packet_buffer;
         }
@@ -788,7 +788,7 @@ static int ProcessPool_worker_loop_with_message_protocol(ProcessPool *pool, Work
 
     worker->pipe_worker->dont_restart = 1;
 
-    while (pool->running) {
+    while (pool->running && !SwooleWG.shutdown) {
         switch (fn()) {
         case 0:
             if (SwooleG.signal_alarm && SwooleTG.timer) {

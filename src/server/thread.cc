@@ -21,6 +21,10 @@ namespace swoole {
 using network::Socket;
 
 Factory *Server::create_thread_factory() {
+#ifndef SW_THREAD
+    swoole_error("Thread support is not enabled, cannot create server with MODE_THREAD");
+    return nullptr;
+#endif
     reactor_num = worker_num;
     connection_list = (Connection *) sw_calloc(max_connection, sizeof(Connection));
     if (connection_list == nullptr) {
@@ -38,7 +42,7 @@ void Server::destroy_thread_factory() {
 }
 
 ThreadFactory::ThreadFactory(Server *server) : BaseFactory(server) {
-    threads_.resize(server_->task_worker_num + server_->worker_num + server_->get_user_worker_num() + 1);
+    threads_.resize(server_->get_all_worker_num() + 1);
 }
 
 bool ThreadFactory::start() {
@@ -61,17 +65,36 @@ bool ThreadFactory::shutdown() {
             thread.join();
         }
     }
+    if (server_->heartbeat_check_interval > 0) {
+        server_->join_heartbeat_thread();
+    }
     return true;
 }
 
-ThreadFactory::~ThreadFactory() {
-
-}
+ThreadFactory::~ThreadFactory() {}
 
 void ThreadFactory::at_thread_exit(Worker *worker) {
     std::unique_lock<std::mutex> _lock(lock_);
     queue_.push(worker);
     cv_.notify_one();
+}
+
+void ThreadFactory::create_message_bus() {
+    auto mb = new MessageBus();
+    mb->set_id_generator(server_->msg_id_generator);
+    mb->set_buffer_size(server_->ipc_max_size);
+    mb->set_always_chunked_transfer();
+    if (!mb->alloc_buffer()) {
+        throw std::bad_alloc();
+    }
+    server_->init_pipe_sockets(mb);
+    SwooleTG.message_bus = mb;
+}
+
+void ThreadFactory::destroy_message_bus() {
+    SwooleTG.message_bus->clear();
+    delete SwooleTG.message_bus;
+    SwooleTG.message_bus = nullptr;
 }
 
 template <typename _Callable>
@@ -102,6 +125,7 @@ void ThreadFactory::spawn_task_worker(WorkerId i) {
         swoole_set_thread_type(Server::THREAD_WORKER);
         swoole_set_process_id(i);
         swoole_set_thread_id(i);
+        create_message_bus();
         Worker *worker = server_->get_worker(i);
         worker->type = SW_PROCESS_TASKWORKER;
         worker->status = SW_WORKER_IDLE;
@@ -116,20 +140,23 @@ void ThreadFactory::spawn_task_worker(WorkerId i) {
                 pool->onWorkerStop(pool, worker);
             }
         });
+        destroy_message_bus();
         at_thread_exit(worker);
     });
 }
 
 void ThreadFactory::spawn_user_worker(WorkerId i) {
     create_thread(i, [=]() {
-        Worker *worker = server_->user_worker_list.at(i - server_->task_worker_num - server_->worker_num);
+        Worker *worker = server_->get_worker(i);
         swoole_set_process_type(SW_PROCESS_USERWORKER);
         swoole_set_thread_type(Server::THREAD_WORKER);
         swoole_set_process_id(i);
         swoole_set_thread_id(i);
+        create_message_bus();
         worker->type = SW_PROCESS_USERWORKER;
         SwooleWG.worker = worker;
         server_->worker_thread_start([=]() { server_->onUserWorkerStart(server_, worker); });
+        destroy_message_bus();
         at_thread_exit(worker);
     });
 }
@@ -185,14 +212,11 @@ void ThreadFactory::wait() {
 }
 
 int Server::start_worker_threads() {
-    /**
-     * heartbeat thread
-     */
-    if (heartbeat_check_interval >= 1) {
+    ThreadFactory *_factory = dynamic_cast<ThreadFactory *>(factory);
+
+    if (heartbeat_check_interval > 0) {
         start_heartbeat_thread();
     }
-
-    ThreadFactory *_factory = dynamic_cast<ThreadFactory *>(factory);
 
     if (task_worker_num > 0) {
         SW_LOOP_N(task_worker_num) {
@@ -210,12 +234,13 @@ int Server::start_worker_threads() {
         }
     }
 
-    int manager_thread_id = task_worker_num + worker_num + get_user_worker_num();
+    int manager_thread_id = get_all_worker_num();
     _factory->spawn_manager_thread(manager_thread_id);
 
     if (swoole_event_init(0) < 0) {
         return SW_ERR;
     }
+
     Reactor *reactor = sw_reactor();
     for (auto iter = ports.begin(); iter != ports.end(); iter++) {
         auto port = *iter;
@@ -228,8 +253,25 @@ int Server::start_worker_threads() {
         }
         reactor->add(port->socket, SW_EVENT_READ);
     }
+
     SwooleTG.id = reactor->id = manager_thread_id + 1;
     store_listen_socket();
+
     return start_master_thread(reactor);
+}
+
+void Server::stop_worker_threads() {
+    DataHead event = {};
+    event.type = SW_SERVER_EVENT_SHUTDOWN;
+
+    SW_LOOP_N(worker_num) {
+        send_to_worker_from_worker(get_worker(i), &event, sizeof(event), SW_PIPE_MASTER);
+    }
+
+    if (task_worker_num > 0) {
+        SW_LOOP_N(task_worker_num) {
+            send_to_worker_from_worker(get_worker(worker_num + i), &event, sizeof(event), SW_PIPE_MASTER);
+        }
+    }
 }
 }  // namespace swoole

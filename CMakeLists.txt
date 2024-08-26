@@ -100,6 +100,11 @@ if (DEFINED enable_trace_log)
 	add_definitions(-DSW_LOG_TRACE_OPEN)
 endif()
 
+if (DEFINED enable_asan)
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+endif()
+
 execute_process(COMMAND php-config --includes OUTPUT_VARIABLE PHP_INCLUDES OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND php-config --extension-dir OUTPUT_VARIABLE PHP_EXTENSION_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${PHP_INCLUDES}")
@@ -122,7 +127,8 @@ link_directories(${LIBRARY_OUTPUT_PATH})
 add_library(lib-swoole SHARED ${SRC_LIST})
 set_target_properties(lib-swoole PROPERTIES OUTPUT_NAME "swoole" VERSION ${SWOOLE_VERSION})
 target_link_libraries(lib-swoole ${SWOOLE_LINK_LIBRARIES})
-if(CODE_COVERAGE)
+
+if (CODE_COVERAGE)
     target_link_libraries(lib-swoole coverage_config gcov)
 endif(CODE_COVERAGE)
 
@@ -160,6 +166,10 @@ add_library(ext-swoole SHARED ${ext_src_list})
 set_target_properties(ext-swoole PROPERTIES PREFIX "")
 set_target_properties(ext-swoole PROPERTIES OUTPUT_NAME "swoole")
 add_dependencies(ext-swoole lib-swoole)
+
+if (DEFINED enable_thread)
+    add_definitions(-DSW_THREAD)
+endif()
 
 # find libpq
 if (DEFINED libpq_dir)

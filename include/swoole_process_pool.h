@@ -105,6 +105,7 @@ struct Worker;
 struct WorkerGlobal {
     bool run_always;
     bool shutdown;
+    bool running;
     uint32_t max_request;
     Worker *worker;
     Worker *worker_copy;
@@ -116,6 +117,7 @@ struct Worker {
     WorkerId id;
     ProcessPool *pool;
     MsgQueue *queue;
+    bool shared;
 
     bool redirect_stdout;
     bool redirect_stdin;

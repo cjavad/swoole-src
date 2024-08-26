@@ -143,12 +143,7 @@ bool BaseFactory::end(SessionId session_id, int flags) {
                          session_id,
                          session->fd,
                          session->reactor_id);
-        Worker *worker = server_->get_worker(session->reactor_id);
-        if (worker->pipe_master->send_async((const char *) &_send.info, sizeof(_send.info)) < 0) {
-            swoole_sys_warning("failed to send %lu bytes to pipe_master", sizeof(_send.info));
-            return false;
-        }
-        return true;
+        return forward_message(session, &_send);
     }
 
     Connection *conn = server_->get_connection_verify_no_ssl(session_id);
@@ -188,18 +183,18 @@ bool BaseFactory::end(SessionId session_id, int flags) {
     conn->closing = 0;
     conn->closed = 1;
     conn->close_errno = 0;
+    network::Socket *_socket = conn->socket;
 
-    if (conn->socket == nullptr) {
+    if (_socket == nullptr) {
         swoole_warning("session#%ld->socket is nullptr", session_id);
         return false;
     }
 
-    if (Buffer::empty(conn->socket->out_buffer) || (conn->close_reset || conn->peer_closed || conn->close_force)) {
+    if (Buffer::empty(_socket->out_buffer) || (conn->close_reset || conn->peer_closed || conn->close_force)) {
         Reactor *reactor = SwooleTG.reactor;
-        return Server::close_connection(reactor, conn->socket) == SW_OK;
+        return Server::close_connection(reactor, _socket) == SW_OK;
     } else {
-        BufferChunk *chunk = conn->socket->out_buffer->alloc(BufferChunk::TYPE_CLOSE, 0);
-        chunk->value.data.val1 = _send.info.type;
+        _socket->out_buffer->alloc(BufferChunk::TYPE_CLOSE, 0);
         conn->close_queued = 1;
         return true;
     }
@@ -215,29 +210,34 @@ bool BaseFactory::finish(SendData *data) {
                          session_id,
                          session->fd,
                          session->reactor_id);
-        Worker *worker = server_->gs->event_workers.get_worker(session->reactor_id);
-        EventData proxy_msg{};
 
-        if (data->info.type == SW_SERVER_EVENT_SEND_DATA) {
-            if (!server_->get_worker_message_bus()->write(worker->pipe_master, data)) {
-                swoole_sys_warning("failed to send %u bytes to pipe_master", data->info.len);
-                return false;
-            }
-            swoole_trace(
-                "proxy message, fd=%d, len=%ld", worker->pipe_master->fd, sizeof(proxy_msg.info) + proxy_msg.info.len);
-        } else if (data->info.type == SW_SERVER_EVENT_SEND_FILE) {
-            memcpy(&proxy_msg.info, &data->info, sizeof(proxy_msg.info));
-            memcpy(proxy_msg.data, data->data, data->info.len);
-            size_t __len = sizeof(proxy_msg.info) + proxy_msg.info.len;
-            return worker->pipe_master->send_async((const char *) &proxy_msg, __len);
+        if (data->info.type == SW_SERVER_EVENT_SEND_DATA || data->info.type == SW_SERVER_EVENT_SEND_FILE) {
+            return forward_message(session, data);
         } else {
             swoole_warning("unknown event type[%d]", data->info.type);
             return false;
         }
-        return true;
     } else {
         return server_->send_to_connection(data) == SW_OK;
     }
+}
+
+bool BaseFactory::forward_message(Session *session, SendData *data) {
+    Worker *worker = server_->gs->event_workers.get_worker(session->reactor_id);
+    swoole_trace_log(SW_TRACE_SERVER,
+                     "fd=%d, worker_id=%d, type=%d, len=%ld",
+                     worker->pipe_master->get_fd(),
+                     session->reactor_id,
+                     data->info.type,
+                     data->info.len);
+
+    auto mb = server_->get_worker_message_bus();
+    auto sock = server_->is_thread_mode() ? mb->get_pipe_socket(worker->pipe_master) : worker->pipe_master;
+    if (!mb->write(sock, data)) {
+        swoole_sys_warning("failed to send %u bytes to pipe_master", data->info.len);
+        return false;
+    }
+    return true;
 }
 
 }  // namespace swoole

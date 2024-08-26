@@ -103,19 +103,16 @@ int Socket::sendfile_blocking(const char *filename, off_t offset, size_t length,
         length = offset + length;
     }
 
-    int n, sendn;
+    ssize_t n, sent_bytes;
     while (offset < (off_t) length) {
         if (wait_event(timeout_ms, SW_EVENT_WRITE) < 0) {
             return SW_ERR;
-        } else {
-            sendn = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
-            n = ::swoole_sendfile(fd, file.get_fd(), &offset, sendn);
-            if (n <= 0) {
-                swoole_sys_warning("sendfile(%d, %s) failed", fd, filename);
-                return SW_ERR;
-            } else {
-                continue;
-            }
+        }
+        sent_bytes = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
+        n = ::swoole_sendfile(fd, file.get_fd(), &offset, sent_bytes);
+        if (n <= 0) {
+            swoole_sys_warning("sendfile(%d, %s) failed", fd, filename);
+            return SW_ERR;
         }
     }
     return SW_OK;
@@ -552,7 +549,7 @@ int Socket::handle_sendfile() {
     int ret;
     Buffer *buffer = out_buffer;
     BufferChunk *chunk = buffer->front();
-    SendfileRequest *task = (SendfileRequest *) chunk->value.object;
+    SendfileRequest *task = (SendfileRequest *) chunk->value.ptr;
 
     if (task->offset == 0) {
         cork();
@@ -616,7 +613,7 @@ int Socket::handle_send() {
         return SW_OK;
     }
 
-    ssize_t ret = send(chunk->value.ptr + chunk->offset, sendn, 0);
+    ssize_t ret = send(chunk->value.str + chunk->offset, sendn, 0);
     if (ret < 0) {
         switch (catch_write_error(errno)) {
         case SW_ERROR:
@@ -648,7 +645,7 @@ int Socket::handle_send() {
 }
 
 static void Socket_sendfile_destructor(BufferChunk *chunk) {
-    SendfileRequest *task = (SendfileRequest *) chunk->value.object;
+    SendfileRequest *task = (SendfileRequest *) chunk->value.ptr;
     delete task;
 }
 
@@ -688,7 +685,7 @@ int Socket::sendfile(const char *filename, off_t offset, size_t length) {
     }
 
     BufferChunk *chunk = out_buffer->alloc(BufferChunk::TYPE_SENDFILE, 0);
-    chunk->value.object = task.release();
+    chunk->value.ptr = task.release();
     chunk->destroy = Socket_sendfile_destructor;
 
     return SW_OK;
@@ -770,6 +767,17 @@ ssize_t Socket::send_async(const void *__buf, size_t __n) {
         return send_blocking(__buf, __n);
     } else {
         return swoole_event_write(this, __buf, __n);
+    }
+}
+
+ssize_t Socket::read_sync(void *__buf, size_t __len, int timeout_ms) {
+    struct pollfd event;
+    event.fd = fd;
+    event.events = POLLIN;
+    if (poll(&event, 1, timeout_ms) == 1) {
+        return read(__buf, __len);
+    } else {
+        return -1;
     }
 }
 
@@ -1179,7 +1187,7 @@ int Socket::ssl_connect() {
     return SW_ERR;
 }
 
-int Socket::ssl_sendfile(const File &fp, off_t *_offset, size_t _size) {
+ssize_t Socket::ssl_sendfile(const File &fp, off_t *_offset, size_t _size) {
     char buf[SW_BUFFER_SIZE_BIG];
     ssize_t readn = _size > sizeof(buf) ? sizeof(buf) : _size;
 
