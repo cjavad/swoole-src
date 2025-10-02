@@ -32,11 +32,11 @@ struct ThreadMapObject {
 };
 
 static sw_inline ThreadMapObject *map_fetch_object(zend_object *obj) {
-    return (ThreadMapObject *) ((char *) obj - swoole_thread_map_handlers.offset);
+    return reinterpret_cast<ThreadMapObject *>(reinterpret_cast<char *>(obj) - swoole_thread_map_handlers.offset);
 }
 
 static void map_free_object(zend_object *object) {
-    ThreadMapObject *mo = map_fetch_object(object);
+    auto mo = map_fetch_object(object);
     if (mo->map) {
         mo->map->del_ref();
         mo->map = nullptr;
@@ -45,14 +45,14 @@ static void map_free_object(zend_object *object) {
 }
 
 static zend_object *map_create_object(zend_class_entry *ce) {
-    ThreadMapObject *mo = (ThreadMapObject *) zend_object_alloc(sizeof(ThreadMapObject), ce);
+    auto mo = static_cast<ThreadMapObject *>(zend_object_alloc(sizeof(ThreadMapObject), ce));
     zend_object_std_init(&mo->std, ce);
     object_properties_init(&mo->std, ce);
     mo->std.handlers = &swoole_thread_map_handlers;
     return &mo->std;
 }
 
-static ThreadMapObject *map_fetch_object_check(zval *zobject) {
+static ThreadMapObject *map_fetch_object_check(const zval *zobject) {
     ThreadMapObject *map = map_fetch_object(Z_OBJ_P(zobject));
     if (!map->map) {
         php_swoole_fatal_error(E_ERROR, "must call constructor first");
@@ -60,13 +60,13 @@ static ThreadMapObject *map_fetch_object_check(zval *zobject) {
     return map;
 }
 
-ThreadResource *php_swoole_thread_map_cast(zval *zobject) {
+ThreadResource *php_swoole_thread_map_cast(const zval *zobject) {
     return map_fetch_object(Z_OBJ_P(zobject))->map;
 }
 
 void php_swoole_thread_map_create(zval *return_value, ThreadResource *resource) {
     auto obj = map_create_object(swoole_thread_map_ce);
-    auto mo = (ThreadMapObject *) map_fetch_object(obj);
+    auto mo = map_fetch_object(obj);
     mo->map = static_cast<ZendArray *>(resource);
     ZVAL_OBJ(return_value, obj);
 }
@@ -87,6 +87,7 @@ static PHP_METHOD(swoole_thread_map, add);
 static PHP_METHOD(swoole_thread_map, update);
 static PHP_METHOD(swoole_thread_map, clean);
 static PHP_METHOD(swoole_thread_map, toArray);
+static PHP_METHOD(swoole_thread_map, sort);
 SW_EXTERN_C_END
 
 // clang-format off
@@ -106,6 +107,7 @@ static const zend_function_entry swoole_thread_map_methods[] = {
     PHP_ME(swoole_thread_map, keys,            arginfo_class_Swoole_Thread_Map_keys,          ZEND_ACC_PUBLIC)
     PHP_ME(swoole_thread_map, values,          arginfo_class_Swoole_Thread_Map_values,        ZEND_ACC_PUBLIC)
     PHP_ME(swoole_thread_map, toArray,         arginfo_class_Swoole_Thread_Map_toArray,       ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread_map, sort,            arginfo_class_Swoole_Thread_Map_sort,          ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 // clang-format on
@@ -115,8 +117,7 @@ void php_swoole_thread_map_minit(int module_number) {
     swoole_thread_map_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_NOT_SERIALIZABLE;
     SW_SET_CLASS_CLONEABLE(swoole_thread_map, sw_zend_class_clone_deny);
     SW_SET_CLASS_UNSET_PROPERTY_HANDLER(swoole_thread_map, sw_zend_class_unset_property_deny);
-    SW_SET_CLASS_CUSTOM_OBJECT(
-        swoole_thread_map, map_create_object, map_free_object, ThreadMapObject, std);
+    SW_SET_CLASS_CUSTOM_OBJECT(swoole_thread_map, map_create_object, map_free_object, ThreadMapObject, std);
 
     zend_class_implements(swoole_thread_map_ce, 2, zend_ce_arrayaccess, zend_ce_countable);
 }
@@ -130,7 +131,7 @@ static PHP_METHOD(swoole_thread_map, __construct) {
 
     auto mo = map_fetch_object(Z_OBJ_P(ZEND_THIS));
     if (mo->map != nullptr) {
-        zend_throw_error(NULL, "Constructor of %s can only be called once", SW_Z_OBJCE_NAME_VAL_P(ZEND_THIS));
+        zend_throw_error(nullptr, "Constructor of %s can only be called once", SW_Z_OBJCE_NAME_VAL_P(ZEND_THIS));
         return;
     }
 
@@ -141,11 +142,47 @@ static PHP_METHOD(swoole_thread_map, __construct) {
     }
 }
 
+static int handle_array_key(const zval *key, zend_ulong *idx) {
+    switch (Z_TYPE_P(key)) {
+    case IS_STRING:
+        return _zend_handle_numeric_str(Z_STRVAL_P(key), Z_STRLEN_P(key), idx) ? IS_LONG : IS_STRING;
+    case IS_LONG:
+        *idx = Z_LVAL_P(key);
+        return IS_LONG;
+    case IS_NULL:
+        return IS_NULL;
+    case IS_DOUBLE:
+        *idx = zend_dval_to_lval_safe(Z_DVAL_P(key));
+        return IS_LONG;
+    case IS_FALSE:
+        *idx = 0;
+        return IS_LONG;
+    case IS_TRUE:
+        *idx = 1;
+        return IS_LONG;
+    case IS_RESOURCE:
+        zend_use_resource_as_offset(key);
+        *idx = Z_RES_HANDLE_P(key);
+        return IS_LONG;
+    default:
+        zend_argument_type_error(1, "Illegal offset type");
+        return IS_UNDEF;
+    }
+}
+
 #define ZEND_ARRAY_CALL_METHOD(array, method, zkey, ...)                                                               \
-    if (ZVAL_IS_LONG(zkey)) {                                                                                          \
-        array->intkey_##method(zkey, ##__VA_ARGS__);                                                                   \
-    } else {                                                                                                           \
+    zend_ulong idx;                                                                                                    \
+    int type_of_key = handle_array_key(zkey, &idx);                                                                    \
+    if (type_of_key == IS_LONG) {                                                                                      \
+        array->intkey_##method(idx, ##__VA_ARGS__);                                                                    \
+    } else if (type_of_key == IS_STRING) {                                                                             \
         array->strkey_##method(zkey, ##__VA_ARGS__);                                                                   \
+    } else if (type_of_key == IS_NULL) {                                                                               \
+        zval empty_str;                                                                                                \
+        ZVAL_EMPTY_STRING(&empty_str);                                                                                 \
+        array->strkey_##method(&empty_str, ##__VA_ARGS__);                                                             \
+    } else {                                                                                                           \
+        zend_type_error("Illegal offset type");                                                                        \
     }
 
 static PHP_METHOD(swoole_thread_map, offsetGet) {
@@ -260,7 +297,7 @@ static PHP_METHOD(swoole_thread_map, values) {
 
 static PHP_METHOD(swoole_thread_map, toArray) {
     auto mo = map_fetch_object_check(ZEND_THIS);
-    mo->map->toArray(return_value);
+    mo->map->to_array(return_value);
 }
 
 static PHP_METHOD(swoole_thread_map, clean) {
@@ -268,4 +305,8 @@ static PHP_METHOD(swoole_thread_map, clean) {
     mo->map->clean();
 }
 
+static PHP_METHOD(swoole_thread_map, sort) {
+    auto mo = map_fetch_object_check(ZEND_THIS);
+    mo->map->sort(false);
+}
 #endif

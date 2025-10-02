@@ -11,7 +11,6 @@ require __DIR__ . '/../../include/bootstrap.php';
 
 use Swoole\Thread;
 
-const SIZE = 2 * 1024 * 1024;
 $port = get_constant_port(__FILE__);
 
 $serv = new Swoole\Http\Server('127.0.0.1', $port, SWOOLE_THREAD);

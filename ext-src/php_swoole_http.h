@@ -20,7 +20,9 @@
 
 #include "swoole_http.h"
 #include "swoole_http2.h"
-#include "thirdparty/swoole_http_parser.h"
+#include "swoole_llhttp.h"
+#include "swoole_websocket.h"
+
 #include "thirdparty/multipart_parser.h"
 
 #include <unordered_map>
@@ -32,6 +34,15 @@
 #define SW_ZLIB_ENCODING_GZIP 0x1f
 #define SW_ZLIB_ENCODING_DEFLATE 0x0f
 #define SW_ZLIB_ENCODING_ANY 0x2f
+#endif
+
+#ifdef SW_HAVE_BROTLI
+#include <brotli/encode.h>
+#include <brotli/decode.h>
+#endif
+
+#ifdef SW_HAVE_ZSTD
+#include <zstd.h>
 #endif
 
 #include <nghttp2/nghttp2.h>
@@ -52,18 +63,26 @@ enum swHttpCompressMethod {
     HTTP_COMPRESS_GZIP,
     HTTP_COMPRESS_DEFLATE,
     HTTP_COMPRESS_BR,
+    HTTP_COMPRESS_ZSTD,
+};
+
+enum swHttpErrorStatusCode {
+    HTTP_ESTATUS_CONNECT_FAILED = -1,
+    HTTP_ESTATUS_REQUEST_TIMEOUT = -2,
+    HTTP_ESTATUS_SERVER_RESET = -3,
+    HTTP_ESTATUS_SEND_FAILED = -4,
 };
 
 namespace swoole {
 class Server;
 class Coroutine;
+
 namespace http2 {
 class Stream;
 class Session;
 }  // namespace http2
 
 namespace http {
-
 struct Request {
     int version;
     char *path;
@@ -98,7 +117,7 @@ struct Request {
 };
 
 struct Response {
-    enum swoole_http_method method;
+    enum llhttp_method method;
     int version;
     int status;
     char *reason;
@@ -129,9 +148,7 @@ struct Context {
     uchar send_trailer_ : 1;
     uchar keepalive : 1;
     uchar websocket : 1;
-#ifdef SW_HAVE_ZLIB
     uchar websocket_compression : 1;
-#endif
     uchar upgrade : 1;
     uchar detached : 1;
     uchar parse_cookie : 1;
@@ -151,10 +168,13 @@ struct Context {
     std::shared_ptr<String> zlib_buffer;
 #endif
 
+    std::shared_ptr<String> frame_buffer;
+    WebSocketSettings websocket_settings;
+
     Request request;
     Response response;
 
-    swoole_http_parser parser;
+    llhttp_t parser;
     multipart_parser *mt_parser;
 
     uint16_t input_var_num;
@@ -191,7 +211,9 @@ struct Context {
     bool parse_multipart_data(const char *at, size_t length);
     bool set_header(const char *, size_t, zval *, bool);
     bool set_header(const char *, size_t, const char *, size_t, bool);
+    bool set_header(const char *, size_t, const std::string &, bool);
     void end(zval *zdata, zval *return_value);
+    void write(zval *zdata, zval *return_value);
     bool send_file(const char *file, uint32_t l_file, off_t offset, size_t length);
     void send_trailer(zval *return_value);
     String *get_write_buffer();
@@ -208,7 +230,9 @@ struct Context {
     bool compress(const char *data, size_t length);
 #endif
 
+    void recv_websocket_frame(zval *return_value, double timeout);
     void http2_end(zval *zdata, zval *return_value);
+    void http2_write(zval *zdata, zval *return_value);
     bool http2_send_file(const char *file, uint32_t l_file, off_t offset, size_t length);
 
     bool is_available();
@@ -270,6 +294,7 @@ class Stream {
 
     bool send_header(const String *body, bool end_stream);
     bool send_body(const String *body, bool end_stream, size_t max_frame_size, off_t offset = 0, size_t length = 0);
+    bool send_end_stream_data_frame();
     bool send_trailer();
 
     void reset(uint32_t error_code);
@@ -345,7 +370,7 @@ static sw_inline zval *swoole_http_init_and_read_property(
     return *zproperty_store_pp;
 }
 
-static inline bool swoole_http_has_crlf(const char *value, size_t length) {
+static sw_inline bool swoole_http_has_crlf(const char *value, size_t length) {
     /* new line/NUL character safety check */
     for (size_t i = 0; i < length; i++) {
         /* RFC 7230 ch. 3.2.4 deprecates folding support */

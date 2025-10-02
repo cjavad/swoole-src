@@ -17,6 +17,7 @@
  */
 
 #include "php_swoole_cxx.h"
+#include "php_swoole_process.h"
 
 #include "swoole_server.h"
 
@@ -103,6 +104,10 @@ void php_swoole_timer_minit(int module_number) {
     SW_REGISTER_DOUBLE_CONSTANT("SWOOLE_TIMER_MAX_SEC", SW_TIMER_MAX_SEC);
 }
 
+void php_swoole_timer_rshutdown() {
+    php_swoole_timer_clear_all();
+}
+
 static void timer_dtor(TimerNode *tnode) {
     Function *fci = (Function *) tnode->data;
     sw_zend_fci_params_discard(&fci->fci);
@@ -115,13 +120,13 @@ bool php_swoole_timer_clear(TimerNode *tnode) {
 }
 
 bool php_swoole_timer_clear_all() {
-    if (UNEXPECTED(!SwooleTG.timer)) {
+    if (UNEXPECTED(!swoole_timer_is_available())) {
         return false;
     }
 
-    size_t num = SwooleTG.timer->count(), index = 0;
+    size_t num = sw_timer()->count(), index = 0;
     TimerNode **list = (TimerNode **) emalloc(num * sizeof(TimerNode *));
-    for (auto &kv : SwooleTG.timer->get_map()) {
+    for (auto &kv : sw_timer()->get_map()) {
         TimerNode *tnode = kv.second;
         if (tnode->type == TimerNode::TYPE_PHP) {
             list[index++] = tnode;
@@ -143,9 +148,18 @@ static void timer_callback(Timer *timer, TimerNode *tnode) {
     if (UNEXPECTED(!fci->call(nullptr, php_swoole_is_enable_coroutine()))) {
         php_swoole_error(E_WARNING, "%s->onTimeout handler error", ZSTR_VAL(swoole_timer_ce->name));
     }
-    if (!tnode->interval || tnode->removed) {
-        timer_dtor(tnode);
+}
+
+static bool timer_if_use_reactor() {
+    auto server = sw_server();
+    if (server) {
+        return server->is_user_worker() || (server->is_task_worker() && server->task_enable_coroutine);
     }
+    auto process_pool = sw_process_pool();
+    if (process_pool) {
+        return !process_pool->is_master();
+    }
+    return true;
 }
 
 static void timer_add(INTERNAL_FUNCTION_PARAMETERS, bool persistent) {
@@ -166,12 +180,14 @@ static void timer_add(INTERNAL_FUNCTION_PARAMETERS, bool persistent) {
         RETURN_FALSE;
     }
 
-    // no server || user worker || task process with async mode
-    if (!sw_server() || sw_server()->is_user_worker() ||
-        (sw_server()->is_task_worker() && sw_server()->task_enable_coroutine)) {
+    if (UNEXPECTED(!sw_reactor() && timer_if_use_reactor())) {
         php_swoole_check_reactor();
     }
 
+    /**
+     * In certain systems, such as macOS, zend_long is the long long type,
+     * and it must be explicitly converted to long.
+     */
     tnode = swoole_timer_add((long) ms, persistent, timer_callback, fci);
     if (UNEXPECTED(!tnode)) {
         php_swoole_fatal_error(E_WARNING, "add timer failed");

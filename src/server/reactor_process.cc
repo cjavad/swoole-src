@@ -15,7 +15,6 @@
  */
 
 #include "swoole_server.h"
-#include "swoole_memory.h"
 
 namespace swoole {
 using network::Socket;
@@ -25,7 +24,7 @@ static int ReactorProcess_onClose(Reactor *reactor, Event *event);
 static void ReactorProcess_onTimeout(Timer *timer, TimerNode *tnode);
 
 int Server::start_reactor_processes() {
-    single_thread = 1;
+    single_thread = true;
 
     // listen TCP
     if (have_stream_sock == 1) {
@@ -47,7 +46,7 @@ int Server::start_reactor_processes() {
         }
     }
 
-    ProcessPool *pool = &gs->event_workers;
+    ProcessPool *pool = get_event_worker_pool();
     *pool = {};
     if (pool->create(worker_num, 0, SW_IPC_UNIXSOCK) < 0) {
         return SW_ERR;
@@ -57,18 +56,18 @@ int Server::start_reactor_processes() {
     /**
      * store to ProcessPool object
      */
-    gs->event_workers.ptr = this;
-    gs->event_workers.max_wait_time = max_wait_time;
-    gs->event_workers.use_msgqueue = 0;
-    gs->event_workers.main_loop = worker_main_loop;
-    gs->event_workers.onWorkerNotFound = wait_other_worker;
-    memcpy(workers, gs->event_workers.workers, sizeof(*workers) * worker_num);
-    gs->event_workers.workers = workers;
+    pool->ptr = this;
+    pool->max_wait_time = max_wait_time;
+    pool->use_msgqueue = 0;
+    pool->main_loop = reactor_process_main_loop;
+    pool->onWorkerNotFound = wait_other_worker;
+    memcpy(workers, pool->workers, sizeof(*workers) * worker_num);
+    pool->workers = workers;
 
     SW_LOOP_N(worker_num) {
-        gs->event_workers.workers[i].pool = &gs->event_workers;
-        gs->event_workers.workers[i].id = i;
-        gs->event_workers.workers[i].type = SW_PROCESS_WORKER;
+        pool->workers[i].pool = pool;
+        pool->workers[i].id = i;
+        pool->workers[i].type = SW_WORKER;
     }
 
     init_ipc_max_size();
@@ -77,11 +76,11 @@ int Server::start_reactor_processes() {
     }
 
     if (is_single_worker()) {
-        Worker *worker = &gs->event_workers.workers[0];
+        Worker *worker = &pool->workers[0];
         SwooleWG.worker = worker;
-        int retval = worker_main_loop(&gs->event_workers, worker);
+        int retval = reactor_process_main_loop(pool, worker);
         if (retval == SW_OK) {
-            gs->event_workers.destroy();
+            pool->destroy();
         }
         return retval;
     }
@@ -91,9 +90,10 @@ int Server::start_reactor_processes() {
 
 static int ReactorProcess_onPipeRead(Reactor *reactor, Event *event) {
     SendData _send;
-    Server *serv = (Server *) reactor->ptr;
-    Factory *factory = serv->factory;
-    PipeBuffer *pipe_buffer = serv->message_bus.get_buffer();
+    auto *serv = static_cast<Server *>(reactor->ptr);
+    auto *factory = serv->factory;
+    auto *pipe_buffer = serv->message_bus.get_buffer();
+    auto *worker = serv->get_worker(reactor->id);
 
     ssize_t retval = serv->message_bus.read(event->socket);
     if (retval <= 0) {
@@ -102,11 +102,15 @@ static int ReactorProcess_onPipeRead(Reactor *reactor, Event *event) {
 
     switch (pipe_buffer->info.type) {
     case SW_SERVER_EVENT_PIPE_MESSAGE: {
-        serv->onPipeMessage(serv, (EventData *) pipe_buffer);
+        serv->onPipeMessage(serv, reinterpret_cast<EventData *>(pipe_buffer));
         break;
     }
     case SW_SERVER_EVENT_FINISH: {
-        serv->onFinish(serv, (EventData *) pipe_buffer);
+        serv->onFinish(serv, reinterpret_cast<EventData *>(pipe_buffer));
+        break;
+    }
+    case SW_SERVER_EVENT_SHUTDOWN: {
+        serv->stop_async_worker(worker);
         break;
     }
     case SW_SERVER_EVENT_SEND_FILE: {
@@ -128,7 +132,8 @@ static int ReactorProcess_onPipeRead(Reactor *reactor, Event *event) {
         factory->finish(&_send);
         break;
     }
-    case SW_SERVER_EVENT_CLOSE: {
+    case SW_SERVER_EVENT_CLOSE:
+    case SW_SERVER_EVENT_CLOSE_FORWARD: {
         factory->end(pipe_buffer->info.fd, Server::CLOSE_ACTIVELY);
         break;
     }
@@ -151,19 +156,13 @@ static int ReactorProcess_onPipeRead(Reactor *reactor, Event *event) {
     return SW_OK;
 }
 
-int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
-    Server *serv = (Server *) pool->ptr;
-    SwooleG.pid = getpid();
-    swoole_set_process_type(SW_PROCESS_WORKER);
-    swoole_set_process_id(worker->id);
+int Server::reactor_process_main_loop(ProcessPool *pool, Worker *worker) {
+    auto *serv = static_cast<Server *>(pool->ptr);
+    swoole_set_worker_type(SW_EVENT_WORKER);
+    swoole_set_worker_id(worker->id);
+    swoole_set_worker_pid(getpid());
 
-    if (serv->max_request > 0) {
-        SwooleWG.run_always = false;
-    }
-    SwooleWG.max_request = serv->max_request;
-    SwooleTG.id = 0;
-
-    serv->init_worker(worker);
+    serv->init_event_worker(worker);
 
     if (!SwooleTG.reactor) {
         if (swoole_event_init(0) < 0) {
@@ -174,15 +173,17 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
     Reactor *reactor = SwooleTG.reactor;
 
     if (SwooleTG.timer && SwooleTG.timer->get_reactor() == nullptr) {
-        SwooleTG.timer->reinit(reactor);
+        SwooleTG.timer->reinit();
     }
 
     serv->worker_signal_init();
 
+    serv->gs->connection_nums[worker->id] = 0;
+
     for (auto ls : serv->ports) {
 #if defined(__linux__) and defined(HAVE_REUSEPORT)
         if (ls->is_stream() && serv->enable_reuse_port) {
-            if (ls->create_socket(serv) < 0) {
+            if (ls->create_socket() < 0) {
                 swoole_event_free();
                 return SW_ERR;
             }
@@ -192,6 +193,7 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
             }
         }
 #endif
+        ls->gs->connection_nums[worker->id] = 0;
         if (reactor->add(ls->socket, SW_EVENT_READ) < 0) {
             return SW_ERR;
         }
@@ -205,11 +207,11 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
 
     // set event handler
     // connect
-    reactor->set_handler(SW_FD_STREAM_SERVER, accept_connection);
+    reactor->set_handler(SW_FD_STREAM_SERVER, SW_EVENT_READ, accept_connection);
     // close
     reactor->default_error_handler = ReactorProcess_onClose;
     // pipe
-    reactor->set_handler(SW_FD_PIPE | SW_EVENT_READ, ReactorProcess_onPipeRead);
+    reactor->set_handler(SW_FD_PIPE, SW_EVENT_READ, ReactorProcess_onPipeRead);
 
     serv->store_listen_socket();
 
@@ -227,8 +229,8 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
     // task workers
     if (serv->task_worker_num > 0) {
         if (serv->task_ipc_mode == Server::TASK_IPC_UNIXSOCK) {
-            SW_LOOP_N(serv->gs->task_workers.worker_num) {
-                serv->gs->task_workers.workers[i].pipe_master->set_nonblock();
+            SW_LOOP_N(serv->get_task_worker_pool()->worker_num) {
+                serv->get_task_worker_pool()->workers[i].pipe_master->set_nonblock();
             }
         }
     }
@@ -237,8 +239,8 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
 
     if (worker->id == 0) {
         serv->gs->master_pid = getpid();
-        if (serv->onStart && !serv->gs->called_onStart) {
-            serv->gs->called_onStart = 1;
+        if (serv->onStart && !serv->gs->onstart_called) {
+            serv->gs->onstart_called = true;
             serv->onStart(serv);
         }
     }
@@ -256,13 +258,13 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
      */
     if (serv->heartbeat_check_interval > 0) {
         serv->heartbeat_timer =
-            swoole_timer_add((long) (serv->heartbeat_check_interval * 1000), true, ReactorProcess_onTimeout, reactor);
+            swoole_timer_add(sec2msec(serv->heartbeat_check_interval), true, ReactorProcess_onTimeout, reactor);
         if (serv->heartbeat_timer == nullptr) {
             goto _fail;
         }
     }
 
-    int retval = reactor->wait(nullptr);
+    int retval = reactor->wait();
 
     /**
      * Close all connections
@@ -287,7 +289,7 @@ int Server::worker_main_loop(ProcessPool *pool, Worker *worker) {
 
 static int ReactorProcess_onClose(Reactor *reactor, Event *event) {
     int fd = event->fd;
-    Server *serv = (Server *) reactor->ptr;
+    auto *serv = (Server *) reactor->ptr;
     Connection *conn = serv->get_connection(fd);
     if (conn == nullptr || conn->active == 0) {
         return SW_ERR;
@@ -312,8 +314,8 @@ static int ReactorProcess_onClose(Reactor *reactor, Event *event) {
 }
 
 static void ReactorProcess_onTimeout(Timer *timer, TimerNode *tnode) {
-    Reactor *reactor = (Reactor *) tnode->data;
-    Server *serv = (Server *) reactor->ptr;
+    auto *reactor = static_cast<Reactor *>(tnode->data);
+    auto *serv = static_cast<Server *>(reactor->ptr);
     Event notify_ev{};
     double now = microtime();
 

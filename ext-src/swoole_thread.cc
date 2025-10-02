@@ -22,10 +22,7 @@
 #include <sys/ipc.h>
 #include <sys/resource.h>
 
-#include <thread>
-#include <unordered_map>
-
-#include "swoole_lock.h"
+#include <atomic>
 
 BEGIN_EXTERN_C()
 #include "stubs/php_swoole_thread_arginfo.h"
@@ -45,64 +42,108 @@ static struct {
 
 TSRMLS_CACHE_EXTERN();
 
-typedef std::thread Thread;
+using swoole::Thread;
+
+struct PhpThread {
+    std::shared_ptr<Thread> thread;
+
+    PhpThread() : thread(std::make_shared<Thread>()) {}
+
+    bool join() const {
+        if (!thread->joinable()) {
+            return false;
+        }
+        thread->join();
+        return true;
+    }
+};
 
 struct ThreadObject {
-    Thread *thread;
+    PhpThread *pt;
     zend_object std;
 };
 
-static void php_swoole_thread_join(zend_object *object);
-static void php_swoole_thread_register_stdio_file_handles(bool no_close);
+static void thread_register_stdio_file_handles(bool no_close);
 
 static thread_local zval thread_argv = {};
 static thread_local JMP_BUF *thread_bailout = nullptr;
+static std::atomic<size_t> thread_num(1);
 
 static sw_inline ThreadObject *thread_fetch_object(zend_object *obj) {
-    return (ThreadObject *) ((char *) obj - swoole_thread_handlers.offset);
+    return reinterpret_cast<ThreadObject *>(reinterpret_cast<char *>(obj) - swoole_thread_handlers.offset);
+}
+
+static sw_inline ThreadObject *thread_fetch_object(const zval *zobj) {
+    return thread_fetch_object(Z_OBJ_P(zobj));
+}
+
+static sw_inline PhpThread *thread_get_php_thread(zend_object *obj) {
+    return thread_fetch_object(obj)->pt;
+}
+
+static sw_inline PhpThread *thread_get_php_thread(const zval *zobj) {
+    return thread_fetch_object(zobj)->pt;
 }
 
 static void thread_free_object(zend_object *object) {
-    php_swoole_thread_join(object);
+    auto pt = thread_get_php_thread(object);
+    pt->join();
+    delete pt;
     zend_object_std_dtor(object);
 }
 
 static zend_object *thread_create_object(zend_class_entry *ce) {
-    ThreadObject *to = (ThreadObject *) zend_object_alloc(sizeof(ThreadObject), ce);
+    auto to = static_cast<ThreadObject *>(zend_object_alloc(sizeof(ThreadObject), ce));
     zend_object_std_init(&to->std, ce);
     object_properties_init(&to->std, ce);
+    to->pt = new PhpThread();
     to->std.handlers = &swoole_thread_handlers;
     return &to->std;
 }
 
-static void php_swoole_thread_join(zend_object *object) {
-    ThreadObject *to = thread_fetch_object(object);
-    if (to->thread && to->thread->joinable()) {
-        to->thread->join();
-        delete to->thread;
-        to->thread = nullptr;
-    }
-}
-
 SW_EXTERN_C_BEGIN
 static PHP_METHOD(swoole_thread, __construct);
+static PHP_METHOD(swoole_thread, isAlive);
 static PHP_METHOD(swoole_thread, join);
 static PHP_METHOD(swoole_thread, joinable);
+static PHP_METHOD(swoole_thread, getExitStatus);
 static PHP_METHOD(swoole_thread, detach);
 static PHP_METHOD(swoole_thread, getArguments);
 static PHP_METHOD(swoole_thread, getId);
-static PHP_METHOD(swoole_thread, getTsrmInfo);
+static PHP_METHOD(swoole_thread, getInfo);
+static PHP_METHOD(swoole_thread, activeCount);
+static PHP_METHOD(swoole_thread, yield);
+static PHP_METHOD(swoole_thread, setName);
+#ifdef HAVE_CPU_AFFINITY
+static PHP_METHOD(swoole_thread, setAffinity);
+static PHP_METHOD(swoole_thread, getAffinity);
+#endif
+static PHP_METHOD(swoole_thread, setPriority);
+static PHP_METHOD(swoole_thread, getPriority);
+static PHP_METHOD(swoole_thread, getNativeId);
 SW_EXTERN_C_END
 
 // clang-format off
 static const zend_function_entry swoole_thread_methods[] = {
-    PHP_ME(swoole_thread, __construct,  arginfo_class_Swoole_Thread___construct,  ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_thread, join,         arginfo_class_Swoole_Thread_join,         ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_thread, joinable,     arginfo_class_Swoole_Thread_joinable,     ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_thread, detach,       arginfo_class_Swoole_Thread_detach,       ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_thread, getArguments, arginfo_class_Swoole_Thread_getArguments, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(swoole_thread, getId,        arginfo_class_Swoole_Thread_getId,        ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(swoole_thread, getTsrmInfo,  arginfo_class_Swoole_Thread_getTsrmInfo,  ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, __construct,   arginfo_class_Swoole_Thread___construct,   ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, isAlive,       arginfo_class_Swoole_Thread_isAlive,       ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, join,          arginfo_class_Swoole_Thread_join,          ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, joinable,      arginfo_class_Swoole_Thread_joinable,      ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, getExitStatus, arginfo_class_Swoole_Thread_getExitStatus, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, detach,        arginfo_class_Swoole_Thread_detach,        ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_thread, getArguments,  arginfo_class_Swoole_Thread_getArguments,  ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, getId,         arginfo_class_Swoole_Thread_getId,         ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, getInfo,       arginfo_class_Swoole_Thread_getInfo,       ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, activeCount,   arginfo_class_Swoole_Thread_activeCount,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, yield,         arginfo_class_Swoole_Thread_yield,         ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, setName,       arginfo_class_Swoole_Thread_setName,       ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+#ifdef HAVE_CPU_AFFINITY
+    PHP_ME(swoole_thread, setAffinity,   arginfo_class_Swoole_Thread_setAffinity,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, getAffinity,   arginfo_class_Swoole_Thread_getAffinity,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+#endif
+    PHP_ME(swoole_thread, setPriority,   arginfo_class_Swoole_Thread_setPriority,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, getPriority,   arginfo_class_Swoole_Thread_getPriority,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(swoole_thread, getNativeId,   arginfo_class_Swoole_Thread_getNativeId,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
 // clang-format on
@@ -117,6 +158,23 @@ void php_swoole_thread_minit(int module_number) {
     zend_declare_property_long(swoole_thread_ce, ZEND_STRL("id"), 0, ZEND_ACC_PUBLIC | ZEND_ACC_READONLY);
     zend_declare_class_constant_long(
         swoole_thread_ce, ZEND_STRL("HARDWARE_CONCURRENCY"), std::thread::hardware_concurrency());
+    zend_declare_class_constant_string(swoole_thread_ce, ZEND_STRL("API_NAME"), tsrm_api_name());
+
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_OTHER"), SCHED_OTHER);
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_FIFO"), SCHED_FIFO);
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_RR"), SCHED_RR);
+#ifdef SCHED_BATCH
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_BATCH"), SCHED_BATCH);
+#endif
+#ifdef SCHED_ISO
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_ISO"), SCHED_ISO);
+#endif
+#ifdef SCHED_IDLE
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_IDLE"), SCHED_IDLE);
+#endif
+#ifdef SCHED_DEADLINE
+    zend_declare_class_constant_long(swoole_thread_ce, ZEND_STRL("SCHED_DEADLINE"), SCHED_DEADLINE);
+#endif
 
     SW_INIT_CLASS_ENTRY_DATA_OBJECT(swoole_thread_error, "Swoole\\Thread\\Error");
     zend_declare_property_long(swoole_thread_error_ce, ZEND_STRL("code"), 0, ZEND_ACC_PUBLIC | ZEND_ACC_READONLY);
@@ -139,8 +197,8 @@ static PHP_METHOD(swoole_thread, __construct) {
         return;
     }
 
-    ThreadObject *to = thread_fetch_object(Z_OBJ_P(ZEND_THIS));
-    zend_string *file = zend_string_init(script_file, l_script_file, 1);
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    zend_string *file = zend_string_init(script_file, l_script_file, true);
 
     if (argc > 0) {
         argv = new ZendArray();
@@ -150,40 +208,36 @@ static PHP_METHOD(swoole_thread, __construct) {
     }
 
     try {
-        to->thread = new std::thread([file, argv]() { php_swoole_thread_start(file, argv); });
+        pt->thread->start([file, argv, pt]() { php_swoole_thread_start(pt->thread, file, argv); });
     } catch (const std::exception &e) {
         zend_throw_exception(swoole_exception_ce, e.what(), SW_ERROR_SYSTEM_CALL_FAIL);
         return;
     }
-    zend_update_property_long(
-        swoole_thread_ce, SW_Z8_OBJ_P(ZEND_THIS), ZEND_STRL("id"), (zend_long) to->thread->native_handle());
+
+    zend::object_set(ZEND_THIS, ZEND_STRL("id"), (zend_long) pt->thread->get_id());
+}
+
+static PHP_METHOD(swoole_thread, isAlive) {
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    RETURN_BOOL(pt->thread->is_alive());
 }
 
 static PHP_METHOD(swoole_thread, join) {
-    ThreadObject *to = thread_fetch_object(Z_OBJ_P(ZEND_THIS));
-    if (!to || !to->thread || !to->thread->joinable()) {
-        RETURN_FALSE;
-    }
-    php_swoole_thread_join(Z_OBJ_P(ZEND_THIS));
-    RETURN_TRUE;
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    RETURN_BOOL(pt->join());
 }
 
 static PHP_METHOD(swoole_thread, joinable) {
-    ThreadObject *to = thread_fetch_object(Z_OBJ_P(ZEND_THIS));
-    if (to == nullptr || !to->thread) {
-        RETURN_FALSE;
-    }
-    RETURN_BOOL(to->thread->joinable());
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    RETURN_BOOL(pt->thread->joinable());
 }
 
 static PHP_METHOD(swoole_thread, detach) {
-    ThreadObject *to = thread_fetch_object(Z_OBJ_P(ZEND_THIS));
-    if (to == nullptr || !to->thread) {
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    if (!pt->thread->joinable()) {
         RETURN_FALSE;
     }
-    to->thread->detach();
-    delete to->thread;
-    to->thread = nullptr;
+    pt->thread->detach();
     RETURN_TRUE;
 }
 
@@ -197,36 +251,90 @@ static PHP_METHOD(swoole_thread, getId) {
     RETURN_LONG((zend_long) pthread_self());
 }
 
-zend_string *php_swoole_serialize(zval *zdata) {
-    php_serialize_data_t var_hash;
-    smart_str serialized_data = {0};
-
-    PHP_VAR_SERIALIZE_INIT(var_hash);
-    php_var_serialize(&serialized_data, zdata, &var_hash);
-    PHP_VAR_SERIALIZE_DESTROY(var_hash);
-
-    zend_string *result = nullptr;
-    if (!EG(exception)) {
-        result = zend_string_init(serialized_data.s->val, serialized_data.s->len, 1);
-    }
-    smart_str_free(&serialized_data);
-    return result;
+static PHP_METHOD(swoole_thread, getExitStatus) {
+    auto pt = thread_get_php_thread(ZEND_THIS);
+    RETURN_LONG(pt->thread->get_exit_status());
 }
 
-bool php_swoole_unserialize(zend_string *data, zval *zv) {
-    php_unserialize_data_t var_hash;
-    const char *p = ZSTR_VAL(data);
-    size_t l = ZSTR_LEN(data);
+static PHP_METHOD(swoole_thread, setName) {
+    char *name;
+    size_t l_name;
 
-    PHP_VAR_UNSERIALIZE_INIT(var_hash);
-    zend_bool unserialized = php_var_unserialize(zv, (const uchar **) &p, (const uchar *) (p + l), &var_hash);
-    PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
-    if (!unserialized) {
-        swoole_warning("unserialize() failed, Error at offset " ZEND_LONG_FMT " of %zd bytes",
-                       (zend_long) ((char *) p - ZSTR_VAL(data)),
-                       l);
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_STRING(name, l_name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    RETURN_BOOL(swoole_thread_set_name(name));
+}
+
+#ifdef HAVE_CPU_AFFINITY
+static PHP_METHOD(swoole_thread, setAffinity) {
+    zval *array;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_ARRAY(array)
+    ZEND_PARSE_PARAMETERS_END();
+
+    cpu_set_t cpu_set;
+    if (!php_swoole_array_to_cpu_set(array, &cpu_set)) {
+        RETURN_FALSE;
     }
-    return unserialized;
+
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set) < 0) {
+        php_swoole_error(E_WARNING, "pthread_setaffinity_np() failed");
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
+static PHP_METHOD(swoole_thread, getAffinity) {
+    cpu_set_t cpu_set;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set) < 0) {
+        php_swoole_error(E_WARNING, "pthread_getaffinity_np() failed");
+        RETURN_FALSE;
+    }
+    php_swoole_cpu_set_to_array(return_value, &cpu_set);
+}
+#endif
+
+static PHP_METHOD(swoole_thread, setPriority) {
+    zend_long priority, policy = -1;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+    Z_PARAM_LONG(priority)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_LONG(policy)
+    ZEND_PARSE_PARAMETERS_END();
+
+    struct sched_param param;
+    if (policy == -1) {
+        pthread_setschedparam(pthread_self(), policy, &param);
+    }
+
+    param.sched_priority = priority;
+    int retval = pthread_setschedparam(pthread_self(), policy, &param);
+    if (retval == 0) {
+        RETURN_TRUE;
+    } else {
+        php_swoole_sys_error(E_WARNING, "pthread_setschedparam() failed");
+        RETURN_FALSE;
+    }
+}
+
+static PHP_METHOD(swoole_thread, getPriority) {
+    struct sched_param param;
+    int policy;
+    if (pthread_getschedparam(pthread_self(), &policy, &param) != 0) {
+        php_swoole_error(E_WARNING, "pthread_getschedparam() failed");
+        RETURN_FALSE;
+    }
+
+    array_init(return_value);
+    add_assoc_long_ex(return_value, ZEND_STRL("policy"), policy);
+    add_assoc_long_ex(return_value, ZEND_STRL("priority"), param.sched_priority);
+}
+
+static PHP_METHOD(swoole_thread, getNativeId) {
+    RETURN_LONG((zend_long) swoole_thread_get_native_id());
 }
 
 void php_swoole_thread_rinit() {
@@ -245,28 +353,33 @@ void php_swoole_thread_rinit() {
 
 void php_swoole_thread_rshutdown() {
     zval_dtor(&thread_argv);
-    if (tsrm_is_main_thread()) {
-        if (request_info.path_translated) {
-            free((void *) request_info.path_translated);
-            request_info.path_translated = nullptr;
-        }
-        if (request_info.argv_serialized) {
-            zend_string_release(request_info.argv_serialized);
-            request_info.argv_serialized = nullptr;
-        }
+    if (!tsrm_is_main_thread()) {
+        return;
+    }
+    if (sw_active_thread_count() > 1) {
+        swoole_warning("Fatal Error: %zu active threads are running, cannot exit safely.", sw_active_thread_count());
+        exit(200);
+    }
+    if (request_info.path_translated) {
+        free((void *) request_info.path_translated);
+        request_info.path_translated = nullptr;
+    }
+    if (request_info.argv_serialized) {
+        zend_string_release(request_info.argv_serialized);
+        request_info.argv_serialized = nullptr;
     }
 }
 
-static void php_swoole_thread_register_stdio_file_handles(bool no_close) {
+static void thread_register_stdio_file_handles(bool no_close) {
     php_stream *s_in, *s_out, *s_err;
-    php_stream_context *sc_in = NULL, *sc_out = NULL, *sc_err = NULL;
+    php_stream_context *sc_in = nullptr, *sc_out = nullptr, *sc_err = nullptr;
     zend_constant ic, oc, ec;
 
     s_in = php_stream_open_wrapper_ex("php://stdin", "rb", 0, NULL, sc_in);
     s_out = php_stream_open_wrapper_ex("php://stdout", "wb", 0, NULL, sc_out);
     s_err = php_stream_open_wrapper_ex("php://stderr", "wb", 0, NULL, sc_err);
 
-    if (s_in == NULL || s_out == NULL || s_err == NULL) {
+    if (s_in == nullptr || s_out == nullptr || s_err == nullptr) {
         if (s_in) php_stream_close(s_in);
         if (s_out) php_stream_close(s_out);
         if (s_err) php_stream_close(s_err);
@@ -284,19 +397,21 @@ static void php_swoole_thread_register_stdio_file_handles(bool no_close) {
     php_stream_to_zval(s_err, &ec.value);
 
     ZEND_CONSTANT_SET_FLAGS(&ic, CONST_CS, 0);
-    ic.name = zend_string_init_interned("STDIN", sizeof("STDIN") - 1, 0);
+    ic.name = zend_string_init_interned("STDIN", sizeof("STDIN") - 1, false);
     zend_register_constant(&ic);
 
     ZEND_CONSTANT_SET_FLAGS(&oc, CONST_CS, 0);
-    oc.name = zend_string_init_interned("STDOUT", sizeof("STDOUT") - 1, 0);
+    oc.name = zend_string_init_interned("STDOUT", sizeof("STDOUT") - 1, false);
     zend_register_constant(&oc);
 
     ZEND_CONSTANT_SET_FLAGS(&ec, CONST_CS, 0);
-    ec.name = zend_string_init_interned("STDERR", sizeof("STDERR") - 1, 0);
+    ec.name = zend_string_init_interned("STDERR", sizeof("STDERR") - 1, false);
     zend_register_constant(&ec);
 }
 
-void php_swoole_thread_start(zend_string *file, ZendArray *argv) {
+void php_swoole_thread_start(std::shared_ptr<Thread> thread, zend_string *file, ZendArray *argv) {
+    thread_num.fetch_add(1);
+    thread->enter();
     ts_resource(0);
 #if defined(COMPILE_DL_SWOOLE) && defined(ZTS)
     ZEND_TSRMLS_CACHE_UPDATE();
@@ -304,30 +419,26 @@ void php_swoole_thread_start(zend_string *file, ZendArray *argv) {
     zend_file_handle file_handle{};
     zval global_argc, global_argv;
 
-    PG(expose_php) = 0;
-    PG(auto_globals_jit) = 1;
-#if PHP_VERSION_ID >= 80100
+    PG(expose_php) = false;
+    PG(auto_globals_jit) = true;
     PG(enable_dl) = false;
-#else
-    PG(enable_dl) = 0;
-#endif
 
-    swoole_thread_init();
+    swoole_thread_init(false);
 
     if (php_request_startup() != SUCCESS) {
         EG(exit_status) = 1;
         goto _startup_error;
     }
 
-    PG(during_request_startup) = 0;
-    SG(sapi_started) = 0;
+    PG(during_request_startup) = false;
+    SG(sapi_started) = false;
     SG(headers_sent) = 1;
-    SG(request_info).no_headers = 1;
+    SG(request_info).no_headers = true;
     SG(request_info).path_translated = request_info.path_translated;
     SG(request_info).argc = request_info.argc;
 
     zend_stream_init_filename(&file_handle, ZSTR_VAL(file));
-    file_handle.primary_script = 1;
+    file_handle.primary_script = true;
 
     zend_first_try {
         thread_bailout = EG(bailout);
@@ -338,30 +449,36 @@ void php_swoole_thread_start(zend_string *file, ZendArray *argv) {
             zend_hash_update(&EG(symbol_table), ZSTR_KNOWN(ZEND_STR_ARGC), &global_argc);
         }
         if (argv) {
-            argv->toArray(&thread_argv);
+            argv->to_array(&thread_argv);
             argv->del_ref();
         }
-        php_swoole_thread_register_stdio_file_handles(true);
+        thread_register_stdio_file_handles(true);
         php_execute_script(&file_handle);
     }
     zend_end_try();
 
     zend_destroy_file_handle(&file_handle);
 
-    php_request_shutdown(NULL);
-    file_handle.filename = NULL;
+    php_request_shutdown(nullptr);
+    file_handle.filename = nullptr;
 
 _startup_error:
     zend_string_release(file);
+    thread->exit(EG(exit_status));
     ts_free_thread();
-    swoole_thread_clean();
+    swoole_thread_clean(false);
+    thread_num.fetch_sub(1);
+}
+
+size_t sw_active_thread_count(void) {
+    return thread_num.load();
 }
 
 void php_swoole_thread_bailout(void) {
     if (thread_bailout) {
         EG(bailout) = thread_bailout;
-        zend_bailout();
     }
+    zend_bailout();
 }
 
 int php_swoole_thread_stream_cast(zval *zstream) {
@@ -408,6 +525,7 @@ void php_swoole_thread_stream_create(zval *return_value, zend_long sockfd) {
 void php_swoole_thread_co_socket_create(zval *return_value, zend_long sockfd, swSocketType type) {
     int newfd = dup(sockfd);
     if (newfd < 0) {
+    _error:
         object_init_ex(return_value, swoole_thread_error_ce);
         zend::object_set(return_value, ZEND_STRL("code"), errno);
         return;
@@ -416,16 +534,40 @@ void php_swoole_thread_co_socket_create(zval *return_value, zend_long sockfd, sw
     if (sockobj) {
         ZVAL_OBJ(return_value, sockobj);
     } else {
-        // never here
-        abort();
+        goto _error;
     }
 }
 
-static PHP_METHOD(swoole_thread, getTsrmInfo) {
+#ifdef SWOOLE_SOCKETS_SUPPORT
+void php_swoole_thread_php_socket_create(zval *return_value, zend_long sockfd) {
+    int newfd = dup(sockfd);
+    if (newfd < 0) {
+    _error:
+        object_init_ex(return_value, swoole_thread_error_ce);
+        zend::object_set(return_value, ZEND_STRL("code"), errno);
+        return;
+    }
+    object_init_ex(return_value, socket_ce);
+    auto retsock = Z_SOCKET_P(return_value);
+    if (!socket_import_file_descriptor(newfd, retsock)) {
+        goto _error;
+    }
+}
+#endif
+
+static PHP_METHOD(swoole_thread, getInfo) {
     array_init(return_value);
     add_assoc_bool(return_value, "is_main_thread", tsrm_is_main_thread());
     add_assoc_bool(return_value, "is_shutdown", tsrm_is_shutdown());
-    add_assoc_string(return_value, "api_name", tsrm_api_name());
+    add_assoc_long(return_value, "thread_num", thread_num.load());
+}
+
+static PHP_METHOD(swoole_thread, activeCount) {
+    RETURN_LONG(thread_num.load());
+}
+
+static PHP_METHOD(swoole_thread, yield) {
+    std::this_thread::yield();
 }
 
 #define CAST_OBJ_TO_RESOURCE(_name, _type)                                                                             \
@@ -446,7 +588,7 @@ void ArrayItem::store(zval *zvalue) {
         value.dval = zval_get_double(zvalue);
         break;
     case IS_STRING: {
-        value.str = zend_string_init(Z_STRVAL_P(zvalue), Z_STRLEN_P(zvalue), 1);
+        value.str = zend_string_init(Z_STRVAL_P(zvalue), Z_STRLEN_P(zvalue), true);
         break;
     }
     case IS_TRUE:
@@ -467,7 +609,7 @@ void ArrayItem::store(zval *zvalue) {
         break;
     }
     case IS_OBJECT: {
-        if (instanceof_function(Z_OBJCE_P(zvalue), swoole_socket_coro_ce)) {
+        if (sw_zval_is_co_socket(zvalue)) {
             value.socket.fd = php_swoole_thread_co_socket_cast(zvalue, &value.socket.type);
             type = IS_CO_SOCKET;
             if (value.socket.fd == -1) {
@@ -475,6 +617,21 @@ void ArrayItem::store(zval *zvalue) {
             }
             break;
         }
+#ifdef SWOOLE_SOCKETS_SUPPORT
+        else if (sw_zval_is_php_socket(zvalue)) {
+            php_socket *php_sock = SW_Z_SOCKET_P(zvalue);
+            if (php_sock->bsd_socket == -1) {
+                zend_throw_exception(swoole_exception_ce, "invalid socket fd", EBADF);
+                break;
+            }
+            value.socket.fd = dup(php_sock->bsd_socket);
+            if (value.socket.fd == -1) {
+                zend_throw_exception(swoole_exception_ce, "failed to dup socket fd", errno);
+            }
+            type = IS_PHP_SOCKET;
+            break;
+        }
+#endif
         CAST_OBJ_TO_RESOURCE(arraylist, IS_ARRAYLIST)
         CAST_OBJ_TO_RESOURCE(map, IS_MAP)
         CAST_OBJ_TO_RESOURCE(queue, IS_QUEUE)
@@ -498,7 +655,7 @@ void ArrayItem::store(zval *zvalue) {
     }
 }
 
-bool ArrayItem::equals(zval *zvalue) {
+bool ArrayItem::equals(const zval *zvalue) const {
     if (Z_TYPE_P(zvalue) != type) {
         return false;
     }
@@ -518,7 +675,136 @@ bool ArrayItem::equals(zval *zvalue) {
     }
 }
 
-void ArrayItem::fetch(zval *return_value) {
+#define TYPE_PAIR(t1, t2) (((t1) << 4) | (t2))
+#define ITEM_TYPE(item) (item->type)
+#define ITEM_LVAL(item) (item->value.lval)
+#define ITEM_DVAL(item) (item->value.dval)
+#define ITEM_STR(item) (item->value.str)
+
+static int compare_long_to_string(zend_long lval, const zend_string *str) /* {{{ */
+{
+    zend_long str_lval;
+    double str_dval;
+    zend_uchar type = is_numeric_string(ZSTR_VAL(str), ZSTR_LEN(str), &str_lval, &str_dval, false);
+
+    if (type == IS_LONG) {
+        return lval > str_lval ? 1 : lval < str_lval ? -1 : 0;
+    }
+
+    if (type == IS_DOUBLE) {
+        double diff = (double) lval - str_dval;
+        return ZEND_NORMALIZE_BOOL(diff);
+    }
+
+    zend_string *lval_as_str = zend_long_to_str(lval);
+    int cmp_result = zend_binary_strcmp(ZSTR_VAL(lval_as_str), ZSTR_LEN(lval_as_str), ZSTR_VAL(str), ZSTR_LEN(str));
+    zend_string_release(lval_as_str);
+    return ZEND_NORMALIZE_BOOL(cmp_result);
+}
+/* }}} */
+
+static int compare_double_to_string(double dval, const zend_string *str) /* {{{ */
+{
+    zend_long str_lval;
+    double str_dval;
+    zend_uchar type = is_numeric_string(ZSTR_VAL(str), ZSTR_LEN(str), &str_lval, &str_dval, false);
+
+    if (type == IS_LONG) {
+        double diff = dval - (double) str_lval;
+        return ZEND_NORMALIZE_BOOL(diff);
+    }
+
+    if (type == IS_DOUBLE) {
+        if (dval == str_dval) {
+            return 0;
+        }
+        return ZEND_NORMALIZE_BOOL(dval - str_dval);
+    }
+
+    zend_string *dval_as_str = zend_double_to_str(dval);
+    int cmp_result = zend_binary_strcmp(ZSTR_VAL(dval_as_str), ZSTR_LEN(dval_as_str), ZSTR_VAL(str), ZSTR_LEN(str));
+    zend_string_release(dval_as_str);
+    return ZEND_NORMALIZE_BOOL(cmp_result);
+}
+/* }}} */
+
+int ArrayItem::compare(Bucket *a, Bucket *b) {
+    const ArrayItem *op1 = static_cast<ArrayItem *>(Z_PTR(a->val));
+    const ArrayItem *op2 = static_cast<ArrayItem *>(Z_PTR(b->val));
+
+    switch (TYPE_PAIR(ITEM_TYPE(op1), ITEM_TYPE(op2))) {
+    case TYPE_PAIR(IS_LONG, IS_LONG):
+        return ITEM_LVAL(op1) > ITEM_LVAL(op2) ? 1 : (ITEM_LVAL(op1) < ITEM_LVAL(op2) ? -1 : 0);
+
+    case TYPE_PAIR(IS_DOUBLE, IS_LONG):
+        return ZEND_NORMALIZE_BOOL(ITEM_DVAL(op1) - (double) ITEM_LVAL(op2));
+
+    case TYPE_PAIR(IS_LONG, IS_DOUBLE):
+        return ZEND_NORMALIZE_BOOL((double) ITEM_LVAL(op1) - ITEM_DVAL(op2));
+
+    case TYPE_PAIR(IS_DOUBLE, IS_DOUBLE):
+        if (ITEM_DVAL(op1) == ITEM_DVAL(op2)) {
+            return 0;
+        } else {
+            return ZEND_NORMALIZE_BOOL(ITEM_DVAL(op1) - ITEM_DVAL(op2));
+        }
+
+    case TYPE_PAIR(IS_NULL, IS_NULL):
+    case TYPE_PAIR(IS_NULL, IS_FALSE):
+    case TYPE_PAIR(IS_FALSE, IS_NULL):
+    case TYPE_PAIR(IS_FALSE, IS_FALSE):
+    case TYPE_PAIR(IS_TRUE, IS_TRUE):
+        return 0;
+
+    case TYPE_PAIR(IS_NULL, IS_TRUE):
+        return -1;
+
+    case TYPE_PAIR(IS_TRUE, IS_NULL):
+        return 1;
+
+    case TYPE_PAIR(IS_STRING, IS_STRING):
+        if (ITEM_STR(op1) == ITEM_STR(op2)) {
+            return 0;
+        }
+        return zendi_smart_strcmp(ITEM_STR(op1), ITEM_STR(op2));
+
+    case TYPE_PAIR(IS_NULL, IS_STRING):
+        return Z_STRLEN_P(op2) == 0 ? 0 : -1;
+
+    case TYPE_PAIR(IS_STRING, IS_NULL):
+        return Z_STRLEN_P(op1) == 0 ? 0 : 1;
+
+    case TYPE_PAIR(IS_LONG, IS_STRING):
+        return compare_long_to_string(ITEM_LVAL(op1), ITEM_STR(op2));
+
+    case TYPE_PAIR(IS_STRING, IS_LONG):
+        return -compare_long_to_string(ITEM_LVAL(op2), ITEM_STR(op1));
+
+    case TYPE_PAIR(IS_DOUBLE, IS_STRING):
+        if (zend_isnan(ITEM_DVAL(op1))) {
+            return 1;
+        }
+        return compare_double_to_string(ITEM_DVAL(op1), ITEM_STR(op2));
+
+    case TYPE_PAIR(IS_STRING, IS_DOUBLE):
+        if (zend_isnan(ITEM_DVAL(op2))) {
+            return 1;
+        }
+        return -compare_double_to_string(ITEM_DVAL(op2), ITEM_STR(op1));
+
+    case TYPE_PAIR(IS_OBJECT, IS_NULL):
+        return 1;
+
+    case TYPE_PAIR(IS_NULL, IS_OBJECT):
+        return -1;
+
+    default:
+        zend_throw_error(nullptr, "Unsupported operand types");
+        return 1;
+    }
+}
+
+void ArrayItem::fetch(zval *return_value) const {
     switch (type) {
     case IS_LONG:
         RETVAL_LONG(value.lval);
@@ -569,6 +855,11 @@ void ArrayItem::fetch(zval *return_value) {
     case IS_CO_SOCKET:
         php_swoole_thread_co_socket_create(return_value, value.socket.fd, value.socket.type);
         break;
+#ifdef SWOOLE_SOCKETS_SUPPORT
+    case IS_PHP_SOCKET:
+        php_swoole_thread_php_socket_create(return_value, value.socket.fd);
+        break;
+#endif
     case IS_SERIALIZED_OBJECT:
         php_swoole_unserialize(value.serialized_object, return_value);
         break;
@@ -581,7 +872,7 @@ void ArrayItem::release() {
     if (type == IS_STRING) {
         zend_string_release(value.str);
         value.str = nullptr;
-    } else if (type == IS_STREAM_SOCKET || type == IS_CO_SOCKET) {
+    } else if (type == IS_STREAM_SOCKET || type == IS_CO_SOCKET || type == IS_PHP_SOCKET) {
         close(value.socket.fd);
         value.socket.fd = -1;
     } else if (type == IS_SERIALIZED_OBJECT) {
@@ -624,10 +915,9 @@ ArrayItem *ZendArray::incr_create(zval *zvalue, zval *return_value) {
 
 void ZendArray::strkey_incr(zval *zkey, zval *zvalue, zval *return_value) {
     zend::String skey(zkey);
-    ArrayItem *item;
 
     lock_.lock();
-    item = (ArrayItem *) zend_hash_find_ptr(&ht, skey.get());
+    ArrayItem *item = static_cast<ArrayItem *>(zend_hash_find_ptr(&ht, skey.get()));
     if (item) {
         incr_update(item, zvalue, return_value);
     } else {
@@ -638,11 +928,9 @@ void ZendArray::strkey_incr(zval *zkey, zval *zvalue, zval *return_value) {
     lock_.unlock();
 }
 
-void ZendArray::intkey_incr(zval *zkey, zval *zvalue, zval *return_value) {
-    ArrayItem *item;
-    zend_long index = zval_get_long(zkey);
+void ZendArray::intkey_incr(zend_long index, zval *zvalue, zval *return_value) {
     lock_.lock();
-    item = (ArrayItem *) (ArrayItem *) zend_hash_index_find_ptr(&ht, index);
+    auto item = static_cast<ArrayItem *>(zend_hash_index_find_ptr(&ht, index));
     if (item) {
         incr_update(item, zvalue, return_value);
     } else {
@@ -658,9 +946,9 @@ void ZendArray::strkey_decr(zval *zkey, zval *zvalue, zval *return_value) {
     strkey_incr(zkey, &rvalue, return_value);
 }
 
-void ZendArray::intkey_decr(zval *zkey, zval *zvalue, zval *return_value) {
+void ZendArray::intkey_decr(zend_long index, zval *zvalue, zval *return_value) {
     INIT_DECR_VALUE(zvalue);
-    intkey_incr(zkey, &rvalue, return_value);
+    intkey_incr(index, &rvalue, return_value);
 }
 
 void ZendArray::strkey_add(zval *zkey, zval *zvalue, zval *return_value) {
@@ -675,8 +963,7 @@ void ZendArray::strkey_add(zval *zkey, zval *zvalue, zval *return_value) {
     lock_.unlock();
 }
 
-void ZendArray::intkey_add(zval *zkey, zval *zvalue, zval *return_value) {
-    zend_long index = zval_get_long(zkey);
+void ZendArray::intkey_add(zend_long index, zval *zvalue, zval *return_value) {
     lock_.lock();
     if (intkey_exists(index)) {
         RETVAL_FALSE;
@@ -701,8 +988,7 @@ void ZendArray::strkey_update(zval *zkey, zval *zvalue, zval *return_value) {
     lock_.unlock();
 }
 
-void ZendArray::intkey_update(zval *zkey, zval *zvalue, zval *return_value) {
-    zend_long index = zval_get_long(zkey);
+void ZendArray::intkey_update(zend_long index, zval *zvalue, zval *return_value) {
     lock_.lock();
     if (!intkey_exists(index)) {
         RETVAL_FALSE;
@@ -719,7 +1005,7 @@ bool ZendArray::index_offsetGet(zend_long index, zval *return_value) {
     lock_.lock_rd();
     if (index_exists(index)) {
         out_of_range = false;
-        ArrayItem *item = (ArrayItem *) zend_hash_index_find_ptr(&ht, index);
+        auto item = static_cast<ArrayItem *>(zend_hash_index_find_ptr(&ht, index));
         if (item) {
             item->fetch(return_value);
         }
@@ -759,7 +1045,7 @@ bool ZendArray::index_incr(zval *zkey, zval *zvalue, zval *return_value) {
         auto item = incr_create(zvalue, return_value);
         zend_hash_next_index_insert_ptr(&ht, item);
     } else {
-        auto item = (ArrayItem *) zend_hash_index_find_ptr(&ht, index);
+        auto item = static_cast<ArrayItem *>(zend_hash_index_find_ptr(&ht, index));
         incr_update(item, zvalue, return_value);
     }
     lock_.unlock();
@@ -777,7 +1063,7 @@ void ZendArray::index_offsetUnset(zend_long index) {
     zend_long i = index;
     zend_long n = zend_hash_num_elements(&ht);
     HT_FLAGS(&ht) |= HASH_FLAG_PACKED | HASH_FLAG_STATIC_KEYS;
-    ArrayItem *item = (ArrayItem *) zend_hash_index_find_ptr(&ht, index);
+    auto item = static_cast<ArrayItem *>(zend_hash_index_find_ptr(&ht, index));
     delete item;
     while (i < n - 1) {
 #if PHP_VERSION_ID >= 80200
@@ -840,7 +1126,7 @@ void ZendArray::values(zval *return_value) {
     void *tmp;
     ZEND_HASH_FOREACH_PTR(&ht, tmp) {
         zval value;
-        ArrayItem *item = (ArrayItem *) tmp;
+        auto item = static_cast<ArrayItem *>(tmp);
         item->fetch(&value);
         zend_hash_next_index_insert_new(Z_ARR_P(return_value), &value);
     }
@@ -848,7 +1134,7 @@ void ZendArray::values(zval *return_value) {
     lock_.unlock();
 }
 
-void ZendArray::toArray(zval *return_value) {
+void ZendArray::to_array(zval *return_value) {
     lock_.lock_rd();
     zend_ulong elem_count = zend_hash_num_elements(&ht);
     array_init_size(return_value, elem_count);
@@ -857,10 +1143,10 @@ void ZendArray::toArray(zval *return_value) {
     void *tmp;
     ZEND_HASH_FOREACH_KEY_PTR(&ht, index, key, tmp) {
         zval value;
-        ArrayItem *item = (ArrayItem *) tmp;
+        const auto item = static_cast<ArrayItem *>(tmp);
         item->fetch(&value);
         if (key) {
-            zend_hash_add(Z_ARR_P(return_value), key, &value);
+            zend_hash_str_add(Z_ARR_P(return_value), ZSTR_VAL(key), ZSTR_LEN(key), &value);
         } else {
             zend_hash_index_add(Z_ARR_P(return_value), index, &value);
         }
@@ -869,13 +1155,13 @@ void ZendArray::toArray(zval *return_value) {
     lock_.unlock();
 }
 
-void ZendArray::find(zval *search, zval *return_value) {
+void ZendArray::find(const zval *search, zval *return_value) {
     lock_.lock_rd();
     zend_string *key;
     zend_ulong index;
     void *tmp;
     ZEND_HASH_FOREACH_KEY_PTR(&ht, index, key, tmp) {
-        ArrayItem *item = (ArrayItem *) tmp;
+        const auto item = static_cast<ArrayItem *>(tmp);
         if (item->equals(search)) {
             if (key) {
                 RETVAL_STRINGL(ZSTR_VAL(key), ZSTR_LEN(key));
@@ -886,6 +1172,12 @@ void ZendArray::find(zval *search, zval *return_value) {
         }
     }
     ZEND_HASH_FOREACH_END();
+    lock_.unlock();
+}
+
+void ZendArray::sort(bool renumber) {
+    lock_.lock();
+    zend_hash_sort(&ht, ArrayItem::compare, renumber);
     lock_.unlock();
 }
 

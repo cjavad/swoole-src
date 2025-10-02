@@ -21,12 +21,23 @@
 #include "ext/standard/php_filestat.h"
 
 #include <fcntl.h>
+
+#if PHP_VERSION_ID >= 80400
+#ifdef HAVE_SYS_WAIT_H
+#include <sys/wait.h>
+#endif
+#ifdef HAVE_SYS_FILE_H
+#include <sys/file.h>
+#endif
+#else
 #if HAVE_SYS_WAIT_H
 #include <sys/wait.h>
 #endif
 #if HAVE_SYS_FILE_H
 #include <sys/file.h>
 #endif
+#endif
+
 #ifdef HAVE_SYS_MMAN_H
 #include <sys/mman.h>
 #endif
@@ -276,7 +287,7 @@ static php_stream *_sw_php_stream_fopen_from_fd(int fd, const char *mode, const 
     php_stream *stream = sw_php_stream_fopen_from_fd_int_rel(fd, mode, persistent_id);
 
     if (stream) {
-        php_stdio_stream_data *self = (php_stdio_stream_data*)stream->abstract;
+        php_stdio_stream_data *self = (php_stdio_stream_data *) stream->abstract;
 
         _sw_detect_is_seekable(self);
         if (!self->is_seekable) {
@@ -317,10 +328,7 @@ static php_stream_size_t sw_php_stdiop_write(php_stream *stream, const char *buf
         }
         bytes_written = _write(data->fd, buf, (unsigned int)count);
 #else
-        php_stdio_stream_data *self = (php_stdio_stream_data*) stream->abstract;
-        ssize_t bytes_written = self->can_poll ?
-                        swoole_coroutine_write(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count)) :
-                        write(data->fd, buf, count);
+        ssize_t bytes_written = write(data->fd, buf, count);
 #endif
         if (bytes_written < 0) {
             if (PHP_IS_TRANSIENT_ERROR(errno)) {
@@ -382,18 +390,13 @@ static php_stream_size_t sw_php_stdiop_read(php_stream *stream, char *buf, size_
             }
         }
 #endif
-        php_stdio_stream_data *self = (php_stdio_stream_data*) stream->abstract;
-        ret = self->can_poll ?
-                swoole_coroutine_read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count)) :
-                read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count));
+        ret = read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count));
 
         if (ret == (ssize_t) -1 && errno == EINTR) {
             /* Read was interrupted, retry once,
              If read still fails, giveup with feof==0
              so script can retry if desired */
-            ret = self->can_poll ?
-                    swoole_coroutine_read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count)) :
-                    read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count));
+            ret = read(data->fd, buf, PLAIN_WRAP_BUF_SIZE(count));
         }
 
         if (ret < 0) {
@@ -468,13 +471,9 @@ static int sw_php_stdiop_close(php_stream *stream, int close_handle) {
             }
         } else if (data->fd != -1) {
             if ((data->lock_flag & LOCK_EX) || (data->lock_flag & LOCK_SH)) {
-                swoole_coroutine_flock_ex(stream->orig_path, data->fd, LOCK_UN);
+                swoole_coroutine_flock(data->fd, LOCK_UN);
             }
-            if (data->can_poll) {
-                ret = swoole_coroutine_close(data->fd);
-            } else {
-                ret = close_file(data->fd);
-            }
+            ret = close(data->fd);
             data->fd = -1;
         } else {
             return 0; /* everything should be closed already -> success */
@@ -703,7 +702,7 @@ static int sw_php_stdiop_set_option(php_stream *stream, int option, int value, v
         }
 #endif
 
-        if (!swoole_coroutine_flock_ex(stream->orig_path, fd, value)) {
+        if (!swoole_coroutine_flock(fd, value)) {
             data->lock_flag = value;
             return 0;
         } else {
@@ -1150,7 +1149,7 @@ static php_stream *_sw_php_stream_fopen(const char *filename,
 
             return ret;
         }
-        close_file(fd);
+        close(fd);
     }
     if (persistent_id) {
         efree(persistent_id);
@@ -1506,7 +1505,7 @@ static int php_plain_files_metadata(
                 php_error_docref1(NULL, url, E_WARNING, "Unable to create file %s because %s", url, strerror(errno));
                 return 0;
             }
-            close_file(file);
+            close(file);
         }
 
         ret = utime(url, newtime);

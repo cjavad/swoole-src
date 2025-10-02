@@ -20,12 +20,11 @@
 #include "php_swoole_cxx.h"
 
 #ifdef SW_THREAD
-
-#include "swoole_lock.h"
+#include "swoole_thread.h"
 
 typedef uint32_t ThreadResourceId;
-struct ThreadResource;
-struct ZendArray;
+class ThreadResource;
+class ZendArray;
 
 extern zend_class_entry *swoole_thread_ce;
 extern zend_class_entry *swoole_thread_error_ce;
@@ -37,18 +36,16 @@ extern zend_class_entry *swoole_thread_lock_ce;
 extern zend_class_entry *swoole_thread_map_ce;
 extern zend_class_entry *swoole_thread_queue_ce;
 
-void php_swoole_thread_start(zend_string *file, ZendArray *argv);
-zend_string *php_swoole_serialize(zval *zdata);
-bool php_swoole_unserialize(zend_string *data, zval *zv);
-void php_swoole_thread_bailout(void);
+void php_swoole_thread_start(std::shared_ptr<swoole::Thread> thread, zend_string *file, ZendArray *argv);
+void php_swoole_thread_bailout();
 
-ThreadResource *php_swoole_thread_arraylist_cast(zval *zobject);
-ThreadResource *php_swoole_thread_map_cast(zval *zobject);
-ThreadResource *php_swoole_thread_queue_cast(zval *zobject);
-ThreadResource *php_swoole_thread_lock_cast(zval *zobject);
-ThreadResource *php_swoole_thread_atomic_cast(zval *zobject);
-ThreadResource *php_swoole_thread_atomic_long_cast(zval *zobject);
-ThreadResource *php_swoole_thread_barrier_cast(zval *zobject);
+ThreadResource *php_swoole_thread_arraylist_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_map_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_queue_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_lock_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_atomic_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_atomic_long_cast(const zval *zobject);
+ThreadResource *php_swoole_thread_barrier_cast(const zval *zobject);
 
 void php_swoole_thread_arraylist_create(zval *return_value, ThreadResource *resource);
 void php_swoole_thread_map_create(zval *return_value, ThreadResource *resource);
@@ -75,6 +72,7 @@ enum {
     IS_BARRIER = 84,
     IS_ATOMIC = 85,
     IS_ATOMIC_LONG = 86,
+    IS_PHP_SOCKET = 96,
     IS_CO_SOCKET = 97,
     IS_STREAM_SOCKET = 98,
     IS_SERIALIZED_OBJECT = 99,
@@ -123,17 +121,19 @@ struct ArrayItem {
     }
 
     void setKey(zend::String &_key) {
-        key = zend_string_init(_key.val(), _key.len(), 1);
+        key = zend_string_init(_key.val(), _key.len(), true);
     }
 
-    void setKey(zend_string *_key) {
-        key = zend_string_init(ZSTR_VAL(_key), ZSTR_LEN(_key), 1);
+    void setKey(const zend_string *_key) {
+        key = zend_string_init(ZSTR_VAL(_key), ZSTR_LEN(_key), true);
     }
 
     void store(zval *zvalue);
-    void fetch(zval *return_value);
+    void fetch(zval *return_value) const;
     void release();
-    bool equals(zval *zvalue);
+    bool equals(const zval *zvalue) const;
+
+    static int compare(Bucket *a, Bucket *b);
 
     ~ArrayItem() {
         if (value.str) {
@@ -145,16 +145,18 @@ struct ArrayItem {
     }
 };
 
-struct ZendArray : ThreadResource {
+class ZendArray : public ThreadResource {
+  protected:
     swoole::RWLock lock_;
     zend_array ht;
 
     static void item_dtor(zval *pDest) {
-        ArrayItem *item = (ArrayItem *) Z_PTR_P(pDest);
+        auto item = static_cast<ArrayItem *>(Z_PTR_P(pDest));
         delete item;
     }
 
-    ZendArray() : ThreadResource(), lock_(0) {
+  public:
+    ZendArray() : lock_(0) {
         zend_hash_init(&ht, 0, NULL, item_dtor, 1);
     }
 
@@ -170,7 +172,7 @@ struct ZendArray : ThreadResource {
 
     void append(zval *zvalue);
 
-    void add(zend_string *skey, zval *zvalue) {
+    void add(const zend_string *skey, zval *zvalue) {
         auto item = new ArrayItem(zvalue);
         item->setKey(skey);
         zend_hash_add_ptr(&ht, item->key, item);
@@ -187,22 +189,22 @@ struct ZendArray : ThreadResource {
         zend_hash_index_add_ptr(&ht, index, item);
     }
 
-    bool index_exists(zend_long index) {
+    bool index_exists(zend_long index) const {
         return index < (zend_long) zend_hash_num_elements(&ht);
     }
 
-    bool strkey_exists(zend::String &skey) {
-        return zend_hash_find_ptr(&ht, skey.get()) != NULL;
+    bool strkey_exists(zend::String &skey) const {
+        return zend_hash_find_ptr(&ht, skey.get()) != nullptr;
     }
 
-    bool intkey_exists(zend_long index) {
-        return zend_hash_index_find_ptr(&ht, index) != NULL;
+    bool intkey_exists(zend_long index) const {
+        return zend_hash_index_find_ptr(&ht, index) != nullptr;
     }
 
     void strkey_offsetGet(zval *zkey, zval *return_value) {
         zend::String skey(zkey);
         lock_.lock_rd();
-        ArrayItem *item = (ArrayItem *) zend_hash_find_ptr(&ht, skey.get());
+        auto item = static_cast<ArrayItem *>(zend_hash_find_ptr(&ht, skey.get()));
         if (item) {
             item->fetch(return_value);
         }
@@ -233,16 +235,16 @@ struct ZendArray : ThreadResource {
     }
 
     void strkey_incr(zval *zkey, zval *zvalue, zval *return_value);
-    void intkey_incr(zval *zkey, zval *zvalue, zval *return_value);
+    void intkey_incr(zend_long index, zval *zvalue, zval *return_value);
     void strkey_decr(zval *zkey, zval *zvalue, zval *return_value);
-    void intkey_decr(zval *zkey, zval *zvalue, zval *return_value);
+    void intkey_decr(zend_long index, zval *zvalue, zval *return_value);
     bool index_incr(zval *zkey, zval *zvalue, zval *return_value);
     bool index_decr(zval *zkey, zval *zvalue, zval *return_value);
 
     void strkey_add(zval *zkey, zval *zvalue, zval *return_value);
-    void intkey_add(zval *zkey, zval *zvalue, zval *return_value);
+    void intkey_add(zend_long index, zval *zvalue, zval *return_value);
     void strkey_update(zval *zkey, zval *zvalue, zval *return_value);
-    void intkey_update(zval *zkey, zval *zvalue, zval *return_value);
+    void intkey_update(zend_long index, zval *zvalue, zval *return_value);
 
     void count(zval *return_value) {
         lock_.lock_rd();
@@ -252,38 +254,32 @@ struct ZendArray : ThreadResource {
 
     void keys(zval *return_value);
     void values(zval *return_value);
-    void toArray(zval *return_value);
-    void find(zval *search, zval *return_value);
+    void to_array(zval *return_value);
+    void find(const zval *search, zval *return_value);
+    void sort(bool renumber);
 
     void intkey_offsetGet(zend_long index, zval *return_value) {
         lock_.lock_rd();
-        ArrayItem *item = (ArrayItem *) zend_hash_index_find_ptr(&ht, index);
+        auto item = static_cast<ArrayItem *>(zend_hash_index_find_ptr(&ht, index));
         if (item) {
             item->fetch(return_value);
         }
         lock_.unlock();
     }
 
-    void intkey_offsetGet(zval *zkey, zval *return_value) {
-        intkey_offsetGet(zval_get_long(zkey), return_value);
-    }
-
-    void intkey_offsetExists(zval *zkey, zval *return_value) {
-        zend_long index = zval_get_long(zkey);
+    void intkey_offsetExists(zend_long index, zval *return_value) {
         lock_.lock_rd();
         RETVAL_BOOL(intkey_exists(index));
         lock_.unlock();
     }
 
-    void intkey_offsetUnset(zval *zkey) {
-        zend_long index = zval_get_long(zkey);
+    void intkey_offsetUnset(zend_long index) {
         lock_.lock();
         zend_hash_index_del(&ht, index);
         lock_.unlock();
     }
 
-    void intkey_offsetSet(zval *zkey, zval *zvalue) {
-        zend_long index = zval_get_long(zkey);
+    void intkey_offsetSet(zend_long index, zval *zvalue) {
         auto item = new ArrayItem(zvalue);
         lock_.lock();
         zend_hash_index_update_ptr(&ht, index, item);

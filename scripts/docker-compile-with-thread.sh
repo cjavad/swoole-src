@@ -13,11 +13,14 @@ cd "${__DIR__}" && cd ..
 ./scripts/clear.sh
 phpize
 ./configure \
+--enable-brotli \
+--enable-zstd \
 --enable-openssl \
 --enable-sockets \
 --enable-mysqlnd \
 --enable-swoole-curl \
 --enable-cares \
+--enable-swoole-stdext \
 --enable-swoole-pgsql \
 --enable-swoole-thread \
 --with-swoole-odbc=unixODBC,/usr \

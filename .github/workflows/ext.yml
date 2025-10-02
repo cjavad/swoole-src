@@ -7,10 +7,10 @@ env:
 
 jobs:
   build-ubuntu-latest:
-    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[ext]')"
+    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[ubuntu]')"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install-deps
         run: sudo apt update -y && sudo apt install -y libcurl4-openssl-dev php-curl libc-ares-dev
       - name: phpize
@@ -41,12 +41,12 @@ jobs:
           make clean && make -j$(nproc)
 
   build-macos-latest:
-    if: "!contains(github.event.head_commit.message, '--filter=')"
+    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[macos]')"
     runs-on: macos-latest
     steps:
       - name: install dependencies
         run: brew reinstall php
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: phpize
         run: phpize
       - name: build1
@@ -70,28 +70,16 @@ jobs:
           make clean && make -j$(sysctl -n hw.ncpu)
 
   build-alpine-latest:
-    if: "!contains(github.event.head_commit.message, '--filter=')"
+    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[alpine]')"
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        php-version: [ '8.1', '8.2', '8.3' ]
-        alpine-version: [ '3.16', '3.17', '3.18', '3.19', 'edge' ]
-        exclude:
-          - php-version: '8.3'
-            alpine-version: '3.16'
-          - php-version: '8.3'
-            alpine-version: '3.17'
-          - php-version: '8.3'
-            alpine-version: '3.18'
-          - php-version: '8.2'
-            alpine-version: '3.16'
-          - php-version: '8.2'
-            alpine-version: '3.17'
+        php-version: [ '8.1', '8.2', '8.3', '8.4' ]
       max-parallel: 8
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: build
         run: |
           cp .github/workflows/alpine.Dockerfile alpine.Dockerfile
-          docker build -t swoole . -f alpine.Dockerfile --build-arg PHP_VERSION=${{ matrix.php-version }} --build-arg ALPINE_VERSION=${{ matrix.alpine-version }}
+          docker build -t swoole . -f alpine.Dockerfile --build-arg PHP_VERSION=${{ matrix.php-version }}
